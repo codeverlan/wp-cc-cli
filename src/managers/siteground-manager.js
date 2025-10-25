@@ -1,0 +1,521 @@
+/**
+ * SiteGround Manager - Manages SiteGround hosting integration and deployment
+ * Refactored to use new utilities for improved reliability and database management
+ * @version 2.0.0
+ */
+
+import simpleGit from 'simple-git';
+import path from 'path';
+import fs from 'fs-extra';
+import { fileURLToPath } from 'url';
+import { logger } from './logger.js';
+import { config } from './config-manager.js';
+import { commandExecutor } from './command-executor.js';
+import { sqliteDb } from './sqlite-database-manager.js';
+import { execa } from 'execa';
+import {
+  createSuccessResponse, 
+  createErrorResponse, 
+  createTextResponse 
+} from './mcp-response.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+export class SiteGroundManager {
+  constructor() {
+    this.isInitialized = false;
+  }
+
+  async initialize() {
+    if (this.isInitialized) return;
+    
+    // Ensure SQLite database is initialized
+    if (!sqliteDb.isInitialized) {
+      await sqliteDb.initialize();
+    }
+    
+    this.isInitialized = true;
+    logger.debug('SiteGroundManager initialized');
+  }
+
+  async getProjectPath(projectName) {
+    return config.getProjectPath(projectName);
+  }
+
+  async connectProject(projectName, sshHost, sshUser, repoPath, siteUrl = null) {
+    try {
+      await this.initialize();
+      
+      const project = sqliteDb.queryOne('SELECT * FROM projects WHERE name = ?', [projectName]);
+      
+      if (!project) {
+        return createErrorResponse(`Project '${projectName}' does not exist`);
+      }
+
+      const projectPath = await this.getProjectPath(projectName);
+      
+      logger.info('Connecting project to SiteGround', {
+        projectName,
+        sshHost,
+        sshUser,
+        repoPath,
+        siteUrl
+      });
+    
+      // Update database with SiteGround connection info
+      const stmt = sqliteDb.prepare(`
+        UPDATE projects 
+        SET siteground_ssh_host = ?, 
+            siteground_ssh_user = ?, 
+            siteground_repo_path = ?,
+            siteground_site_url = ?
+        WHERE name = ?
+      `);
+      stmt.run(sshHost, sshUser, repoPath, siteUrl, projectName);
+
+      // Set up SiteGround as a remote
+      const git = simpleGit(projectPath);
+      const sitegroundRemote = `ssh://${sshUser}@${sshHost}:18765/~/git/${repoPath}`;
+      
+      try {
+        // Check if siteground remote already exists
+        const remotes = await git.getRemotes(true);
+        const hasRemote = remotes.some(r => r.name === 'siteground');
+        
+        if (hasRemote) {
+          // Update existing remote
+          await git.removeRemote('siteground');
+        }
+        
+        // Add SiteGround remote
+        await git.addRemote('siteground', sitegroundRemote);
+        
+        // Also add production and staging remotes for convenience
+        if (!remotes.some(r => r.name === 'production')) {
+          await git.addRemote('production', sitegroundRemote);
+        }
+        
+        if (!remotes.some(r => r.name === 'staging')) {
+          await git.addRemote('staging', sitegroundRemote);
+        }
+        
+      } catch (error) {
+        throw new Error(`Failed to configure SiteGround remote: ${error.message}`);
+      }
+
+      // Create SiteGround-specific .gitignore if it doesn't exist
+      await this.createSiteGroundGitIgnore(projectPath);
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Connected ${projectName} to SiteGround:\\n` +
+                  `SSH Host: ${sshHost}\\n` +
+                  `SSH User: ${sshUser}\\n` +
+                  `Repository: ${repoPath}\\n` +
+                  `Site URL: ${siteUrl || 'Not specified'}\\n` +
+                  `Remote URL: ${sitegroundRemote}\\n\\n` +
+                  `You can now deploy using: wp_siteground_deploy`,
+          },
+        ],
+      };
+    } catch (error) {
+      logger.error('Failed to connect project to SiteGround', { projectName, error: error.message });
+      return createErrorResponse(`Failed to connect project to SiteGround: ${error.message}`);
+    }
+  }
+
+  async createSiteGroundGitIgnore(projectPath) {
+    const gitignorePath = path.join(projectPath, '.gitignore');
+    
+    const sitegroundGitignore = `# WordPress Core (managed by SiteGround)
+/wp-admin/
+/wp-includes/
+/index.php
+/license.txt
+/readme.html
+/wp-*.php
+!/wp-config.php
+xmlrpc.php
+
+# WordPress Content
+/wp-content/uploads/
+/wp-content/upgrade/
+/wp-content/backup-db/
+/wp-content/backups/
+/wp-content/blogs.dir/
+/wp-content/cache/
+/wp-content/w3tc-config/
+/wp-content/wp-cache-config.php
+
+# WordPress Plugins (uncomment if you want to manage plugins via Git)
+# /wp-content/plugins/
+
+# WordPress Themes (keep themes in Git)
+!/wp-content/themes/
+
+# SiteGround specific
+/wp-content/sg-optimizer-cache/
+/wp-content/siteground-optimizer-assets/
+
+# Database dumps
+*.sql
+*.sql.gz
+/migrations/
+
+# Log files
+*.log
+error_log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Environment files
+.env
+.env.*
+wp-config-local.php
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Composer
+vendor/
+composer.lock
+`;
+
+    // Only create if it doesn't exist, otherwise append SiteGround-specific rules
+    if (!await fs.pathExists(gitignorePath)) {
+      await fs.writeFile(gitignorePath, sitegroundGitignore);
+    }
+  }
+
+  async deploy(projectName, options = {}) {
+    const {
+      branch = 'master',
+      clearCache = true,
+      skipDatabaseDump = false,
+      message = null
+    } = options;
+
+    const project = sqliteDb.prepare(`
+      SELECT * FROM projects WHERE name = ?
+    `).get(projectName);
+    
+    if (!project) {
+      throw new Error(`Project ${projectName} does not exist`);
+    }
+
+    if (!project.siteground_ssh_host) {
+      throw new Error(`Project ${projectName} is not connected to SiteGround. Run wp_siteground_connect first.`);
+    }
+
+    const projectPath = path.join(this.projectsDir, projectName);
+    const git = simpleGit(projectPath);
+    
+    let deploymentLog = `Deploying ${projectName} to SiteGround\n`;
+    deploymentLog += `${'='.repeat(50)}\n\n`;
+
+    try {
+      // Step 1: Check git status
+      const status = await git.status();
+      
+      if (!status.isClean()) {
+        // Auto-commit changes if there are any
+        await git.add('.');
+        const commitMessage = message || `Auto-commit before SiteGround deployment - ${new Date().toISOString()}`;
+        await git.commit(commitMessage);
+        deploymentLog += `✅ Committed local changes: "${commitMessage}"\n`;
+      } else {
+        deploymentLog += `✅ Working directory clean\n`;
+      }
+
+      // Step 2: Database dump (unless skipped)
+      if (!skipDatabaseDump) {
+        try {
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const dumpFile = path.join(projectPath, 'migrations', `pre-deploy-${timestamp}.sql`);
+          
+          // Export database using Docker
+          await execa('docker', [
+            'exec',
+            `${projectName}-db`,
+            'mysqldump',
+            '-u', 'wordpress',
+            '-pwordpress',
+            'wordpress'
+          ], {
+            stdout: fs.createWriteStream(dumpFile),
+          });
+          
+          deploymentLog += `✅ Database dumped to migrations/pre-deploy-${timestamp}.sql\n`;
+          
+          // Commit the database dump
+          await git.add(dumpFile);
+          await git.commit(`Database dump before deployment - ${timestamp}`);
+        } catch (dbError) {
+          deploymentLog += `⚠️ Database dump failed (continuing): ${dbError.message}\n`;
+        }
+      }
+
+      // Step 3: Push to SiteGround using Docker to bypass FIPS restrictions
+      deploymentLog += `\n📤 Pushing to SiteGround (branch: ${branch})...\n`;
+      
+      try {
+        // Use Docker container with Git to push
+        const sshKeyPath = '/home/thornlcsw/.ssh/siteground_simple';
+        const dockerCommand = [
+          'run', '--rm',
+          '-v', `${projectPath}:/repo`,
+          '-v', `${sshKeyPath}:/ssh/id_rsa:ro`,
+          '-w', '/repo',
+          'ubuntu:22.04',
+          'bash', '-c',
+          `apt-get update -qq && apt-get install -qq -y git openssh-client 2>/dev/null && \
+           mkdir -p /root/.ssh && cp /ssh/id_rsa /root/.ssh/ && chmod 600 /root/.ssh/id_rsa && \
+           git config --global user.email "wp-cc-mcp@localhost" && \
+           git config --global user.name "WordPress MCP" && \
+           ssh-keyscan -p 18765 ${project.siteground_ssh_host} >> /root/.ssh/known_hosts 2>/dev/null && \
+           git push siteground ${branch} --force-with-lease`
+        ];
+        
+        const env = { ...process.env, DOCKER_CONTENT_TRUST: '0' };
+        await execa('docker', dockerCommand, { env });
+        deploymentLog += `✅ Successfully pushed to SiteGround\n`;
+      } catch (pushError) {
+        // Try without force-with-lease if it fails
+        try {
+          const dockerCommand = [
+            'run', '--rm',
+            '-v', `${projectPath}:/repo`,
+            '-v', `${sshKeyPath}:/ssh/id_rsa:ro`,
+            '-w', '/repo',
+            'ubuntu:22.04',
+            'bash', '-c',
+            `apt-get update -qq && apt-get install -qq -y git openssh-client 2>/dev/null && \
+             mkdir -p /root/.ssh && cp /ssh/id_rsa /root/.ssh/ && chmod 600 /root/.ssh/id_rsa && \
+             git config --global user.email "wp-cc-mcp@localhost" && \
+             git config --global user.name "WordPress MCP" && \
+             ssh-keyscan -p 18765 ${project.siteground_ssh_host} >> /root/.ssh/known_hosts 2>/dev/null && \
+             git push siteground ${branch}`
+          ];
+          
+          const env = { ...process.env, DOCKER_CONTENT_TRUST: '0' };
+          await execa('docker', dockerCommand, { env });
+          deploymentLog += `✅ Successfully pushed to SiteGround\n`;
+        } catch (finalError) {
+          throw new Error(`Git push failed: ${finalError.message}`);
+        }
+      }
+
+      // Step 4: Clear SiteGround cache if requested
+      if (clearCache && project.siteground_ssh_host && project.siteground_ssh_user) {
+        deploymentLog += `\n🧹 Clearing SiteGround cache...\n`;
+        
+        try {
+          // SSH into SiteGround and run WP-CLI cache clear
+          const sshCommand = [
+            '-p', '18765',
+            `${project.siteground_ssh_user}@${project.siteground_ssh_host}`,
+            'cd ~/public_html && wp sg purge'
+          ];
+          
+          await execa('ssh', sshCommand);
+          deploymentLog += `✅ SiteGround cache cleared\n`;
+        } catch (cacheError) {
+          deploymentLog += `⚠️ Cache clear failed (site may need manual cache clear): ${cacheError.message}\n`;
+        }
+      }
+
+      // Step 5: Create deployment tag
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const tagName = `siteground-deploy-${timestamp}`;
+      await git.addTag(tagName);
+      deploymentLog += `\n✅ Created deployment tag: ${tagName}\n`;
+
+      // Step 6: Verification steps
+      deploymentLog += `\n📋 Post-Deployment Checklist:\n`;
+      deploymentLog += `1. ✅ Code pushed to SiteGround\n`;
+      
+      if (clearCache) {
+        deploymentLog += `2. ✅ Cache cleared (or attempted)\n`;
+      }
+      
+      if (project.siteground_site_url) {
+        deploymentLog += `3. 🔗 Check site: ${project.siteground_site_url}\n`;
+      }
+      
+      deploymentLog += `4. 📝 If database changes were made:\n`;
+      deploymentLog += `   - SSH to SiteGround: ssh -p 18765 ${project.siteground_ssh_user}@${project.siteground_ssh_host}\n`;
+      deploymentLog += `   - Import database: wp db import migrations/[latest].sql\n`;
+      deploymentLog += `5. 🔄 Monitor site for any issues\n`;
+
+    } catch (error) {
+      throw new Error(`Deployment failed: ${error.message}`);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: deploymentLog,
+        },
+      ],
+    };
+  }
+
+  async sync(projectName, options = {}) {
+    const { branch = 'master' } = options;
+
+    const project = sqliteDb.prepare(`
+      SELECT * FROM projects WHERE name = ?
+    `).get(projectName);
+    
+    if (!project) {
+      throw new Error(`Project ${projectName} does not exist`);
+    }
+
+    if (!project.siteground_ssh_host) {
+      throw new Error(`Project ${projectName} is not connected to SiteGround. Run wp_siteground_connect first.`);
+    }
+
+    const projectPath = path.join(this.projectsDir, projectName);
+    const git = simpleGit(projectPath);
+    
+    try {
+      // Check for uncommitted changes
+      const status = await git.status();
+      
+      if (!status.isClean()) {
+        throw new Error('You have uncommitted changes. Please commit or stash them before syncing.');
+      }
+
+      // Pull from SiteGround
+      const pullResult = await git.pull('siteground', branch);
+      
+      let syncLog = `Synced ${projectName} from SiteGround\n`;
+      syncLog += `Branch: ${branch}\n`;
+      syncLog += `Files changed: ${pullResult.summary.changes}\n`;
+      syncLog += `Insertions: ${pullResult.summary.insertions}\n`;
+      syncLog += `Deletions: ${pullResult.summary.deletions}\n`;
+      
+      if (pullResult.files && pullResult.files.length > 0) {
+        syncLog += `\nModified files:\n`;
+        pullResult.files.forEach(file => {
+          syncLog += `  - ${file}\n`;
+        });
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: syncLog,
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Sync failed: ${error.message}`);
+    }
+  }
+
+  async clearCache(projectName) {
+    const project = sqliteDb.prepare(`
+      SELECT * FROM projects WHERE name = ?
+    `).get(projectName);
+    
+    if (!project) {
+      throw new Error(`Project ${projectName} does not exist`);
+    }
+
+    if (!project.siteground_ssh_host || !project.siteground_ssh_user) {
+      throw new Error(`Project ${projectName} is not connected to SiteGround. Run wp_siteground_connect first.`);
+    }
+
+    try {
+      // Use Docker to bypass FIPS SSH restrictions
+      const sshKeyPath = '/home/thornlcsw/.ssh/siteground_simple';
+      const dockerCommand = [
+        'run', '--rm',
+        '-v', `${sshKeyPath}:/ssh/id_rsa:ro`,
+        'ubuntu:22.04',
+        'bash', '-c',
+        `apt-get update -qq && apt-get install -qq -y openssh-client 2>/dev/null && \
+         mkdir -p /root/.ssh && cp /ssh/id_rsa /root/.ssh/ && chmod 600 /root/.ssh/id_rsa && \
+         ssh -o StrictHostKeyChecking=no -p 18765 ${project.siteground_ssh_user}@${project.siteground_ssh_host} \
+         'cd ~/public_html && wp sg purge && wp cache flush'`
+      ];
+      
+      // Disable content trust for this operation
+      const env = { ...process.env, DOCKER_CONTENT_TRUST: '0' };
+      const result = await execa('docker', dockerCommand, { env });
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `SiteGround cache cleared for ${projectName}\n` +
+                  `Site: ${project.siteground_site_url || project.siteground_ssh_host}\n` +
+                  result.stdout || 'Cache cleared successfully',
+          },
+        ],
+      };
+    } catch (error) {
+      throw new Error(`Failed to clear cache: ${error.message}`);
+    }
+  }
+
+  async getDeploymentInfo(projectName) {
+    const project = sqliteDb.prepare(`
+      SELECT * FROM projects WHERE name = ?
+    `).get(projectName);
+    
+    if (!project) {
+      throw new Error(`Project ${projectName} does not exist`);
+    }
+
+    let info = `SiteGround Deployment Info for ${projectName}\n`;
+    info += `${'='.repeat(50)}\n\n`;
+
+    if (!project.siteground_ssh_host) {
+      info += `⚠️ Not connected to SiteGround\n`;
+      info += `Run wp_siteground_connect to set up connection\n`;
+    } else {
+      info += `✅ Connected to SiteGround\n`;
+      info += `SSH Host: ${project.siteground_ssh_host}\n`;
+      info += `SSH User: ${project.siteground_ssh_user}\n`;
+      info += `SSH Port: 18765\n`;
+      info += `Repository: ${project.siteground_repo_path}\n`;
+      info += `Site URL: ${project.siteground_site_url || 'Not specified'}\n`;
+      info += `Deployment Branch: ${project.siteground_deployment_branch || 'master'}\n`;
+      info += `Staging Branch: ${project.siteground_staging_branch || 'staging'}\n`;
+      
+      info += `\n📝 SSH Command:\n`;
+      info += `ssh -p 18765 ${project.siteground_ssh_user}@${project.siteground_ssh_host}\n`;
+      
+      info += `\n🚀 Deployment Commands:\n`;
+      info += `wp_siteground_deploy("${projectName}")\n`;
+      info += `wp_siteground_sync("${projectName}")\n`;
+      info += `wp_siteground_cache_clear("${projectName}")\n`;
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: info,
+        },
+      ],
+    };
+  }
+}

@@ -1,0 +1,111 @@
+#!/usr/bin/env node
+
+/**
+ * WP-CC CLI - WordPress Development CLI Tool
+ * Standalone version of wp-cc-mcp with natural language interface
+ */
+
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+import { program } from 'commander';
+import chalk from 'chalk';
+import { WPCli } from '../src/index.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+// CLI Configuration
+program
+  .name('wp-cc')
+  .description('WordPress Development CLI with natural language interface')
+  .version('1.0.0');
+
+// Natural language command (default)
+program
+  .argument('[command...]', 'Natural language command, e.g., "create project for coffee shop website"')
+  .description('Execute WordPress development commands using natural language')
+  .action(async (command) => {
+    if (command.length === 0) {
+      console.log(chalk.cyan('WP-CC CLI - WordPress Development Tool\n'));
+      console.log(chalk.yellow('Usage Examples:'));
+      console.log(chalk.white('  wp-cc create project for coffee shop website'));
+      console.log(chalk.white('  wp-cc start containers for my-blog'));
+      console.log(chalk.white('  wp-cc research topic "best coffee shops in seattle"'));
+      console.log(chalk.white('  wp-cc test all links for my-website'));
+      console.log(chalk.white('  wp-cc deploy my-site to production'));
+      console.log();
+      console.log(chalk.yellow('Commands:'));
+      console.log(chalk.white('  wp-cc <natural language command>  Execute any command'));
+      console.log(chalk.white('  wp-cc help                       Show help'));
+      console.log(chalk.white('  wp-cc version                    Show version'));
+      console.log();
+      console.log(chalk.magenta('Features:'));
+      console.log(chalk.white('  • 55+ WordPress development tools'));
+      console.log(chalk.white('  • Natural language interface'));
+      console.log(chalk.white('  • Docker container management'));
+      console.log(chalk.white('  • Project lifecycle management'));
+      console.log(chalk.white('  • Research and content generation'));
+      console.log(chalk.white('  • Testing and deployment automation'));
+      process.exit(0);
+    }
+
+    try {
+      const wpCli = new WPCli();
+      const commandText = command.join(' ');
+      console.log(chalk.blue(`🚀 Executing: ${commandText}\n`));
+
+      await wpCli.executeCommand(commandText);
+
+    } catch (error) {
+      console.error(chalk.red('❌ Error:'), error.message);
+      process.exit(1);
+    }
+  });
+
+// Help command
+program
+  .command('help')
+  .description('Show detailed help information')
+  .action(() => {
+    console.log(chalk.cyan('WP-CC CLI - Detailed Help\n'));
+    console.log(chalk.yellow('Available Tool Categories:'));
+    console.log(chalk.white('  📁 Project Management:  create, list, switch, delete projects'));
+    console.log(chalk.white('  🐳 Docker Operations:   start, stop, restart containers'));
+    console.log(chalk.white('  🔍 Research:           research topics, generate content'));
+    console.log(chalk.white('  📊 Database:           dump, import, diff databases'));
+    console.log(chalk.white('  🔀 Git:                 commit, push, pull, status'));
+    console.log(chalk.white('  🧪 Testing:            test links, SEO, comprehensive'));
+    console.log(chalk.white('  🚀 Deployment:         deploy to SiteGround'));
+    console.log(chalk.white('  ⚙️  WordPress:         WP-CLI and REST API operations'));
+    console.log();
+    console.log(chalk.yellow('Natural Language Examples:'));
+    console.log(chalk.white('  wp-cc create a new project called my-blog on port 8080'));
+    console.log(chalk.white('  wp-cc start the docker containers for my-website'));
+    console.log(chalk.white('  wp-cc research coffee shops in seattle and create content'));
+    console.log(chalk.white('  wp-cc test all the links on my-website'));
+    console.log(chalk.white('  wp-cc deploy my-website to siteground production'));
+  });
+
+// Version command
+program
+  .command('version')
+  .description('Show version information')
+  .action(() => {
+    console.log(chalk.cyan('WP-CC CLI'));
+    console.log(chalk.white(`Version: ${program.version()}`));
+    console.log(chalk.gray('Converted from wp-cc-mcp v1.0.0'));
+  });
+
+// Parse command line arguments
+program.parse();
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error(chalk.red('❌ Uncaught Error:'), error.message);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(chalk.red('❌ Unhandled Rejection:'), reason);
+  process.exit(1);
+});
